@@ -4,10 +4,12 @@ natural sort, output naming, encodings, and the resume/failsafe state machine.
 Runs on the stdlib alone: `python test_core.py`. The Gemini call itself is not
 mocked out; the key-manager cooldown logic is checked directly instead.
 """
+import sys
 import tempfile
 from pathlib import Path
 
 import core
+import updater
 
 
 def test_natural_sort():
@@ -411,6 +413,104 @@ def test_model_picker_populates_and_keeps_selection():
     w._models_loaded(["only-one-model"])
     assert w.model.count() == 1
     assert w.model.currentData() == "only-one-model"
+
+
+def test_version_comparison():
+    assert updater.is_newer("v0.2.0", "0.1.0") is True
+    assert updater.is_newer("v1.0.0", "0.1.0") is True
+    assert updater.is_newer("v0.1.1", "0.1.0") is True
+    assert updater.is_newer("v0.1.0", "0.1.0") is False
+    assert updater.is_newer("v0.0.9", "0.1.0") is False
+    # 0.10.0 must beat 0.9.0 numerically, not lexically
+    assert updater.is_newer("v0.10.0", "0.9.0") is True
+    # unparseable versions never look newer, so garbage can't force an update
+    assert updater.is_newer("garbage", "0.1.0") is False
+    assert updater.is_newer("", "0.1.0") is False
+    assert updater.version_tuple("v1.2.3") == (1, 2, 3)
+
+
+def test_fetch_latest_returns_none_for_unusable_input():
+    """Every failure mode collapses to None — a bad check must not raise."""
+    assert updater.fetch_latest("") is None
+    assert updater.fetch_latest("no-slash") is None
+    assert updater.fetch_latest("this-org-xyz-does-not-exist/nope", timeout=20) is None
+
+
+def test_swap_helper_replaces_file_after_exit():
+    """The generated helper must actually move the file once the parent is gone."""
+    import subprocess
+    import tempfile as _tf
+    from pathlib import Path as _Path
+
+    with _tf.TemporaryDirectory() as tmp:
+        root = _Path(tmp)
+        target = root / "NovelTranslator.exe"
+        staged = root / "NovelTranslator.exe.new"
+        target.write_text("OLD", encoding="utf-8")
+        staged.write_text("NEW", encoding="utf-8")
+        helper = root / "helper.py"
+        helper.write_text(updater.HELPER_TEMPLATE, encoding="utf-8")
+
+        # pretend to be a dead parent: a PID that cannot exist
+        result = subprocess.run(
+            [sys.executable, str(helper), str(target), str(staged), "999999999"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert target.read_text(encoding="utf-8") == "NEW", "swap did not happen"
+        assert not staged.exists(), "staged file should be consumed"
+        assert not (root / "NovelTranslator.exe.old").exists(), "backup should be cleaned"
+
+
+def test_schedule_swap_is_a_noop_when_not_frozen():
+    """Running from source there is no exe to replace, so nothing should be spawned."""
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "NovelTranslator.exe"
+        target.write_text("x", encoding="utf-8")
+        assert updater.schedule_swap(target, target.with_suffix(".exe.new")) is None
+
+
+def test_download_writes_partial_then_renames():
+    """A truncated download must never land as a valid-looking .exe."""
+    import io
+    import urllib.request as _u
+    from pathlib import Path as _Path
+
+    payload = b"NOT-REALLY-AN-EXE" * 500
+
+    class FakeResponse(io.BytesIO):
+        headers = {"Content-Length": str(len(payload))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    release = updater.Release(
+        version="v9.9.9",
+        url="http://example/releases",
+        asset_url="http://example/NovelTranslator.exe",
+        asset_name="NovelTranslator.exe",
+    )
+    original = updater._proxy_opener
+    updater._proxy_opener = lambda proxy: _FakeOpener(FakeResponse(payload))
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = updater.download_release(release, _Path(tmp), None)
+            assert out.name == "NovelTranslator.exe"
+            assert out.read_bytes() == payload
+            assert not out.with_suffix(".exe.new").exists(), ".new leftover"
+    finally:
+        updater._proxy_opener = original
+
+
+class _FakeOpener:
+    def __init__(self, response):
+        self.response = response
+
+    def open(self, request, timeout=None):
+        return self.response
 
 
 if __name__ == "__main__":

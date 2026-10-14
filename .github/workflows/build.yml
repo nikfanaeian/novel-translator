@@ -5,7 +5,7 @@ on:
     tags: ["v*"]
   workflow_dispatch:
   pull_request:
-    paths: [app.py, core.py, requirements.txt, .github/workflows/build.yml]
+    paths: [app.py, core.py, updater.py, requirements.txt, .github/workflows/build.yml]
 
 jobs:
   test:

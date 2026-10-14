@@ -32,6 +32,29 @@ python app.py
 Get an API key at <https://aistudio.google.com/apikey> and add it in the GUI. You can
 add several.
 
+## Auto-update
+
+The app polls `nikfanaeian/novel-translator` for new releases. The repo field is
+editable if you fork or self-host.
+
+- Checked once a day at startup, or on demand via **Check for updates**.
+- A newer version prompts to download; progress shows in the status bar.
+- Downloads land beside the app as `NovelTranslator.exe`, written as `.new` first so
+  a half-finished download can never look like a valid install.
+
+**Auto-install only works for the packaged `.exe`.** Windows locks a running
+executable, so the app cannot replace itself. Instead a small helper waits for the
+process to exit and swaps the file in, then you restart. Running from source
+(`python app.py`) the update is downloaded but you install it with `git pull`.
+
+To publish an update: bump `VERSION` in `updater.py`, then
+
+```bash
+git tag v0.2.0 && git push --tags
+```
+
+Actions builds the `.exe` and attaches it to the release; the app picks it up.
+
 ## Network / proxy
 
 If your network blocks `generativelanguage.googleapis.com` directly, route through a
@@ -87,10 +110,11 @@ glossary for recurring terms.
 python test_core.py
 ```
 
-24 checks. Covers chunking (budget respected, no paragraph split mid-way, no content
+29 checks. Covers chunking (budget respected, no paragraph split mid-way, no content
 lost), natural sort, output naming, txt encodings (UTF-8/UTF-16/cp1256), proxy
-normalization and transport caching, model-list filtering and fallbacks, and the state
-machine including "a failed episode leaves no output file".
+normalization and transport caching, model-list filtering and fallbacks, update version
+comparison and the self-replace swap helper, and the state machine including "a failed
+episode leaves no output file".
 
 Everything except the GUI-worker and proxy-transport checks runs on the stdlib alone.
 

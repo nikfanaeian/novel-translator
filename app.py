@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 )
 
 import core
+import updater
 from core import DONE, FAILED, PENDING, EpisodeState, JobState, Translator, TranslatorConfig
 
 APP_DIR = Path(
@@ -156,6 +157,44 @@ class ModelListWorker(QObject):
             self.failed.emit("no models returned")
 
 
+class UpdateWorker(QObject):
+    """Checks for and downloads an update off the GUI thread."""
+
+    available = Signal(object)          # Release
+    up_to_date = Signal(str)            # current version
+    unavailable = Signal(str)           # reason
+    downloaded = Signal(str, int)       # path, bytes
+    progress = Signal(int, int)         # written, total
+
+    def __init__(self, repo: str, proxy: str, parent=None):
+        super().__init__(parent)
+        self.repo, self.proxy = repo, proxy
+
+    @Slot()
+    def check(self) -> None:
+        release = updater.fetch_latest(self.repo, self.proxy)
+        if release is None:
+            self.unavailable.emit(
+                "no release found (or network unavailable)")
+            return
+        if not updater.is_newer(release.version):
+            self.up_to_date.emit(updater.VERSION)
+            return
+        self.available.emit(release)
+
+    @Slot(object)
+    def download(self, release) -> None:
+        try:
+            path = updater.download_release(
+                release, updater.app_dir(), self.proxy,
+                on_progress=lambda w, t: self.progress.emit(w, t),
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed download is not fatal
+            self.unavailable.emit(f"download failed: {exc}"[:180])
+            return
+        self.downloaded.emit(str(path), path.stat().st_size if path.exists() else 0)
+
+
 # ---------------------------------------------------------------- keys panel
 
 
@@ -227,6 +266,9 @@ class MainWindow(QMainWindow):
         self.thread: QThread | None = None
         self.model_worker: ModelListWorker | None = None
         self.model_thread: QThread | None = None
+        self.update_worker: UpdateWorker | None = None
+        self.update_thread: QThread | None = None
+        self.pending_release = None
         self.rows: dict[str, int] = {}
         self.state: JobState | None = None
 
@@ -262,6 +304,19 @@ class MainWindow(QMainWindow):
         proxy_row.addWidget(self.use_proxy)
         proxy_row.addWidget(self.proxy, 1)
         form.addRow(QLabel("Network:"), proxy_row)
+
+        self.repo = QLineEdit(updater.DEFAULT_REPO)
+        self.repo.setPlaceholderText("owner/repo")
+        self.repo.setMaximumWidth(320)
+        self.check_update = QPushButton("Check for updates")
+        self.check_update.clicked.connect(lambda: self.check_for_update())
+        self.update_label = QLabel(f"v{updater.VERSION}")
+        self.update_label.setStyleSheet("color:#666")
+        update_row = QHBoxLayout()
+        update_row.addWidget(self.repo, 1)
+        update_row.addWidget(self.check_update)
+        update_row.addWidget(self.update_label)
+        form.addRow(QLabel("Updates:"), update_row)
         outer.addLayout(form)
         outer.addWidget(self.keys_panel)
 
@@ -384,6 +439,116 @@ class MainWindow(QMainWindow):
         self.append_log(f"models: {message}")
         log.info("model list: %s", message)
 
+    # ---------------------------------------------------------- updates
+
+    def check_for_update(self, quiet: bool = False) -> None:
+        """Poll GitHub for a newer release. Never raises, never blocks the UI."""
+        if self.update_thread is not None:
+            return
+        repo = self.repo.text().strip()
+        if not repo or "/" not in repo:
+            self.update_label.setText("set owner/repo")
+            return
+        self.check_update.setEnabled(False)
+        self.update_label.setText("checking…")
+        proxy = self.proxy.text().strip() if self.use_proxy.isChecked() else ""
+
+        self.update_thread = QThread()
+        self.update_worker = UpdateWorker(repo, proxy)
+        self.update_worker.moveToThread(self.update_thread)
+        self.update_thread.started.connect(self.update_worker.check)
+        self.update_worker.available.connect(self._on_update_available)
+        self.update_worker.up_to_date.connect(
+            lambda v: self._on_update_status(f"v{v} (latest)"))
+        self.update_worker.unavailable.connect(
+            lambda m: self._on_update_status(m, error=True))
+        self.update_worker.downloaded.connect(self._on_update_downloaded)
+        self.update_worker.progress.connect(self._on_update_progress)
+        self.update_thread.start()
+        if quiet:
+            self.append_log(f"update check: {repo}")
+
+    @Slot(object)
+    def _on_update_available(self, release) -> None:
+        self.pending_release = release
+        self.update_label.setText(f"v{release.version} available!")
+        self.update_label.setStyleSheet("color:#0a7a2f;font-weight:600")
+        answer = QMessageBox.question(
+            self, "Update available",
+            f"Version {release.version} is available (you have {updater.VERSION}).\n\n"
+            f"Download it now? It will be installed the next time you start the app."
+        )
+        if answer == QMessageBox.Yes:
+            self._download_update()
+        else:
+            self._finish_update()
+            self.append_log(
+                f"update {release.version} available: {release.notes_url}")
+
+    @Slot(str, int)
+    def _on_update_downloaded(self, path: str, size: int) -> None:
+        self._finish_update()
+        mb = size / 1_048_576 if size else 0
+        self.update_label.setText(f"v{self.pending_release.version} downloaded")
+        self.update_label.setStyleSheet("color:#0a7a2f;font-weight:600")
+        self.append_log(f"downloaded update: {path} ({mb:.1f} MB)")
+
+        if not updater.is_frozen():
+            QMessageBox.information(
+                self, "Update downloaded",
+                f"Saved to:\n{path}\n\n"
+                "Auto-install only works for the packaged .exe build.\n"
+                "Running from source, use git pull instead."
+            )
+            self.pending_release = None
+            return
+
+        target = updater.app_dir() / Path(path).name
+        helper = updater.schedule_swap(target, Path(path))
+        self.pending_release = None
+        if helper:
+            QMessageBox.information(
+                self, "Update ready",
+                "The update will be installed when you close the app.\n\n"
+                "Start it again afterwards to use the new version."
+            )
+        else:
+            self.append_log("could not schedule self-replace; replace manually")
+
+    @Slot(int, int)
+    def _on_update_progress(self, written: int, total: int) -> None:
+        if total:
+            self.bar.setRange(0, total)
+            self.bar.setValue(written)
+            pct = written * 100 // total
+            self.update_label.setText(f"downloading… {pct}%")
+
+    def _download_update(self) -> None:
+        if not self.pending_release:
+            return
+        self.check_update.setEnabled(False)
+        self.update_label.setText("downloading…")
+        self.bar.setRange(0, 0)  # indeterminate until we know the size
+        self.update_worker.download(self.pending_release)
+
+    @Slot(str)
+    def _on_update_status(self, message: str, error: bool = False) -> None:
+        self._finish_update()
+        self.update_label.setText(message)
+        self.update_label.setStyleSheet("color:#b00020" if error else "color:#666")
+
+    def _finish_update(self) -> None:
+        self.bar.setRange(0, 1)
+        self.bar.setValue(1 if self.bar.maximum() == 1 else 0)
+        if self.bar.maximum() == 1:
+            self.bar.setValue(0)
+        self.check_update.setEnabled(True)
+        if self.update_thread is not None:
+            self.update_thread.quit()
+            self.update_thread.wait()
+            self.update_thread = None
+        self.update_worker = None
+
     # ---------------------------------------------------------- prefs
 
     def load_prefs(self) -> None:
@@ -397,6 +562,12 @@ class MainWindow(QMainWindow):
         self.log_path.setText(settings.get("log_path", str(APP_DIR / "noveltranslator.log")))
         self.proxy.setText(settings.get("proxy", core.DEFAULT_PROXY))
         self.use_proxy.setChecked(bool(settings.get("use_proxy", True)))
+        self.repo.setText(settings.get("update_repo", updater.DEFAULT_REPO))
+        # Check once per day, not on every launch.
+        if _should_check(settings.get("last_update_check")):
+            QTimer.singleShot(1500, lambda: self.check_for_update(quiet=True))
+            settings["last_update_check"] = _today()
+            save_settings(settings)
 
     def save_prefs(self) -> None:
         save_settings(
@@ -408,6 +579,7 @@ class MainWindow(QMainWindow):
                 "log_path": self.log_path.text().strip(),
                 "proxy": self.proxy.text().strip(),
                 "use_proxy": self.use_proxy.isChecked(),
+                "update_repo": self.repo.text().strip(),
             }
         )
 
@@ -590,6 +762,19 @@ class MainWindow(QMainWindow):
                 return
         self.save_prefs()
         event.accept()
+
+
+def _today() -> str:
+    import datetime
+
+    return datetime.date.today().isoformat()
+
+
+def _should_check(last: str | None) -> bool:
+    """True when the last check was before today."""
+    if not last:
+        return True
+    return last != _today()
 
 
 def setup_file_log(path: str) -> None:
