@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+*.spec
+.noveltranslator_state.json
