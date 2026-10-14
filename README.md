@@ -78,7 +78,7 @@ Push a `v*` tag and GitHub Actions builds `NovelTranslator.exe` on `windows-late
 attaches it to the release, and skips it if the self-checks fail.
 
 ```bash
-git tag v0.1.0 && git push --tags
+git tag v0.2.0 && git push --tags
 ```
 
 Or grab the artifact from any Actions run without tagging.

@@ -21,7 +21,7 @@ import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 DEFAULT_REPO = "nikfanaeian/novel-translator"
 
 UPDATE_URL_TEMPLATE = "https://github.com/{repo}/releases/latest"
