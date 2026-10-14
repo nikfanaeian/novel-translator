@@ -281,6 +281,26 @@ class TranslationError(RuntimeError):
     """A single chunk failed after exhausting keys and retries."""
 
 
+DEFAULT_PROXY = "socks5://127.0.0.1:10808"
+
+
+def normalize_proxy(value: str | None) -> str | None:
+    """Accept 'host:port' shorthand; return None to mean 'no proxy'.
+
+    'socks5h://' resolves DNS through the proxy, which is what you want when the
+    host can't be reached directly but the proxy can resolve it for you.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    if "://" in value:
+        return value
+    if value.lower().startswith(("127.0.0.1", "localhost", "::1")):
+        # Local proxy, so hostname-vs-IP resolution barely matters; keep it plain.
+        return value if "://" in value else f"socks5://{value}"
+    return f"socks5h://{value}"
+
+
 @dataclass
 class TranslatorConfig:
     api_keys: list[str]
@@ -289,6 +309,7 @@ class TranslatorConfig:
     max_output_tokens: int = 8192
     max_retries: int = 4
     chunk_delay: float = 0.35  # polite pacing; free-tier RPM is the usual wall
+    proxy: str | None = DEFAULT_PROXY  # empty string disables
 
 
 class Translator:
@@ -300,13 +321,49 @@ class Translator:
         self.log = log
         self._cooldown_until: dict[str, float] = {}
         self._active: list[str] = []
+        self._clients: dict[str, object] = {}  # one connection pool per key, reused
+        self._transport = None
 
     def _ready_keys(self) -> list[str]:
         now = time.monotonic()
         return [k for k in self._active if self._cooldown_until.get(k, 0) <= now]
 
-    def translate_chunk(self, text: str, lang_tag: str, history: str = "") -> str:
+    def _proxy_transport(self):
+        """httpx transport bound to the configured SOCKS proxy, built once.
+
+        google-genai passes client_args straight into httpx.Client(**client_args),
+        so the proxy has to arrive as a pre-built transport — an httpx.Client
+        accepts proxy= but SyncHttpxClient does not forward it to a usable mount.
+        """
+        if self._transport is not None:
+            return self._transport
+        proxy = normalize_proxy(self.config.proxy)
+        if not proxy:
+            return None
+        import httpx
+
+        try:
+            self._transport = httpx.HTTPTransport(proxy=proxy)
+        except ImportError as exc:  # socksio missing
+            self.log(f"proxy {proxy} unavailable (pip install 'httpx[socks]'): {exc}")
+            return None
+        self.log(f"using SOCKS proxy: {proxy}")
+        return self._transport
+
+    def _client_for(self, key: str):
+        """One client (and connection pool) per key, reused across chunks and retries."""
         from google import genai
+        from google.genai import types
+
+        if key not in self._clients:
+            kwargs = {}
+            transport = self._proxy_transport()
+            if transport is not None:
+                kwargs["http_options"] = types.HttpOptions(client_args={"transport": transport})
+            self._clients[key] = genai.Client(api_key=key, **kwargs)
+        return self._clients[key]
+
+    def translate_chunk(self, text: str, lang_tag: str, history: str = "") -> str:
         from google.genai import types
 
         if not self._active:
@@ -337,8 +394,8 @@ class Translator:
         last_error: Exception | None = None
         for attempt in range(self.config.max_retries):
             key = keys[attempt % len(keys)]
-            client = genai.Client(api_key=key)
             try:
+                client = self._client_for(key)
                 response = client.models.generate_content(
                     model=self.config.model, contents=contents, config=config
                 )

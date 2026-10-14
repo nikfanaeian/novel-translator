@@ -222,6 +222,18 @@ class MainWindow(QMainWindow):
 
         form = QFormLayout()
         form.addRow(folder_row)
+
+        self.proxy = QLineEdit(core.DEFAULT_PROXY)
+        self.proxy.setPlaceholderText("socks5://127.0.0.1:10808  (leave empty for direct)")
+        self.proxy.setMaximumWidth(320)
+        self.use_proxy = QCheckBox("Use SOCKS5 proxy")
+        self.use_proxy.setChecked(True)
+        self.use_proxy.toggled.connect(self.proxy.setEnabled)
+        self.proxy.setEnabled(True)
+        proxy_row = QHBoxLayout()
+        proxy_row.addWidget(self.use_proxy)
+        proxy_row.addWidget(self.proxy, 1)
+        form.addRow(QLabel("Network:"), proxy_row)
         outer.addLayout(form)
         outer.addWidget(self.keys_panel)
 
@@ -294,6 +306,8 @@ class MainWindow(QMainWindow):
         model_index = self.model.findData(settings.get("model", "gemini-2.5-flash"))
         self.model.setCurrentIndex(max(model_index, 0))
         self.log_path.setText(settings.get("log_path", str(APP_DIR / "noveltranslator.log")))
+        self.proxy.setText(settings.get("proxy", core.DEFAULT_PROXY))
+        self.use_proxy.setChecked(bool(settings.get("use_proxy", True)))
 
     def save_prefs(self) -> None:
         save_settings(
@@ -303,6 +317,8 @@ class MainWindow(QMainWindow):
                 "lang_tag": self.lang.currentData(),
                 "model": self.model.currentData(),
                 "log_path": self.log_path.text().strip(),
+                "proxy": self.proxy.text().strip(),
+                "use_proxy": self.use_proxy.isChecked(),
             }
         )
 
@@ -385,7 +401,10 @@ class MainWindow(QMainWindow):
 
         self.save_prefs()
         setup_file_log(self.log_path.text().strip())
-        config = TranslatorConfig(api_keys=keys, model=self.model.currentData())
+        proxy = self.proxy.text().strip() if self.use_proxy.isChecked() else ""
+        config = TranslatorConfig(
+            api_keys=keys, model=self.model.currentData(), proxy=proxy
+        )
         self.bar.setRange(0, len(todo))
         self.bar.setValue(0)
         self.start_btn.setEnabled(False)

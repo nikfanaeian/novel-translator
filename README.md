@@ -30,6 +30,23 @@ python app.py
 Get an API key at <https://aistudio.google.com/apikey> and add it in the GUI. You can
 add several.
 
+## Network / proxy
+
+If your network blocks `generativelanguage.googleapis.com` directly, route through a
+SOCKS5 proxy. **The proxy field defaults to `socks5://127.0.0.1:10808`** and the
+checkbox is on by default.
+
+- Local proxies get `socks5://`, remote hosts get `socks5h://` so DNS resolves
+  through the proxy too. Bare `host:port` input is accepted and normalized.
+- Untick the checkbox (or clear the field) to connect directly.
+- The setting is saved in `settings.json`.
+
+Requires the SOCKS extra — already in `requirements.txt`:
+
+```bash
+pip install "httpx[socks]"
+```
+
 ## Download the .exe
 
 Push a `v*` tag and GitHub Actions builds `NovelTranslator.exe` on `windows-latest`,
@@ -68,9 +85,12 @@ glossary for recurring terms.
 python test_core.py
 ```
 
-14 checks, stdlib only. Covers chunking (budget respected, no paragraph split
-mid-way, no content lost), natural sort, output naming, txt encodings (UTF-8/UTF-16/
-cp1256), and the state machine including "a failed episode leaves no output file".
+19 checks. Covers chunking (budget respected, no paragraph split mid-way, no content
+lost), natural sort, output naming, txt encodings (UTF-8/UTF-16/cp1256), proxy
+normalization and transport caching, and the state machine including "a failed
+episode leaves no output file".
+
+Everything except the GUI-worker and proxy-transport checks runs on the stdlib alone.
 
 ## Settings
 

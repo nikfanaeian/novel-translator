@@ -235,6 +235,101 @@ def test_worker_survives_a_bad_episode_and_stays_resumable():
         app.Translator = original
 
 
+def test_normalize_proxy_shorthand():
+    assert core.normalize_proxy("") is None
+    assert core.normalize_proxy(None) is None
+    assert core.normalize_proxy("   ") is None
+    assert core.normalize_proxy("127.0.0.1:10808") == "socks5://127.0.0.1:10808"
+    assert core.normalize_proxy("localhost:10808") == "socks5://localhost:10808"
+    # a remote host must resolve DNS through the proxy
+    assert core.normalize_proxy("proxy.example.com:1080") == "socks5h://proxy.example.com:1080"
+    # an explicit scheme is left alone
+    assert core.normalize_proxy("socks5://1.2.3.4:1080") == "socks5://1.2.3.4:1080"
+    assert core.normalize_proxy("http://1.2.3.4:8080") == "http://1.2.3.4:8080"
+
+
+def test_proxy_defaults_to_local_socks5():
+    assert core.DEFAULT_PROXY == "socks5://127.0.0.1:10808"
+    assert core.TranslatorConfig(api_keys=["k"]).proxy == core.DEFAULT_PROXY
+    # empty string disables the proxy entirely
+    assert core.normalize_proxy(core.TranslatorConfig(api_keys=["k"], proxy="").proxy) is None
+
+
+def test_translator_reuses_one_client_per_key():
+    """Guards the connection-pool fix: clients must be cached, not rebuilt per chunk."""
+    import sys, types as _types
+
+    fake = _types.ModuleType("google.genai")
+    made = []
+
+    class FakeClient:
+        def __init__(self, api_key=None, **kwargs):
+            self.api_key = api_key
+            self.kwargs = kwargs
+            made.append(api_key)
+
+    fake.Client = FakeClient
+    google_mod = _types.ModuleType("google")
+    google_mod.genai = fake
+    genai_mod = _types.ModuleType("google.genai")
+    genai_mod.types = core_types_stub()
+    genai_mod.Client = FakeClient
+    fake.types = genai_mod.types
+    google_mod.genai = genai_mod
+
+    old = {k: sys.modules.get(k) for k in ("google", "google.genai")}
+    sys.modules["google"] = google_mod
+    sys.modules["google.genai"] = genai_mod
+    try:
+        t = core.Translator(core.TranslatorConfig(api_keys=["k1", "k2"], proxy=""))
+        t._client_for("k1")
+        t._client_for("k1")
+        t._client_for("k2")
+        assert made == ["k1", "k2"], f"clients rebuilt instead of cached: {made}"
+        assert t._client_for("k1") is t._client_for("k1")
+    finally:
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+def core_types_stub():
+    """Minimal stand-in for google.genai.types so the client-cache test stays offline."""
+    import types as _types
+
+    mod = _types.ModuleType("genai.types")
+
+    class GenerateContentConfig:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+
+    class HttpOptions:
+        def __init__(self, **kw):
+            self.client_args = kw.get("client_args", {})
+
+    mod.GenerateContentConfig = GenerateContentConfig
+    mod.HttpOptions = HttpOptions
+    return mod
+
+
+def test_proxy_transport_is_built_and_cached():
+    try:
+        import httpx
+        import socksio  # noqa: F401
+    except ImportError:
+        print("(skipped test_proxy_transport_is_built_and_cached: httpx[socks] not installed)")
+        return
+    t = core.Translator(core.TranslatorConfig(api_keys=["k"], proxy="socks5://127.0.0.1:10808"))
+    transport = t._proxy_transport()
+    assert transport is not None, "proxy transport should be built when a proxy is set"
+    assert t._proxy_transport() is transport, "transport must be built once and reused"
+    # empty proxy -> None, meaning "go direct"
+    direct = core.Translator(core.TranslatorConfig(api_keys=["k"], proxy=""))
+    assert direct._proxy_transport() is None
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
