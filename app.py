@@ -14,7 +14,7 @@ import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -137,6 +137,25 @@ class TranslateWorker(QObject):
             self.finished.emit(ok, failed)
 
 
+class ModelListWorker(QObject):
+    """Fetches the model list off the GUI thread so the window never freezes."""
+
+    loaded = Signal(list)
+    failed = Signal(str)
+
+    def __init__(self, api_key: str, proxy: str, parent=None):
+        super().__init__(parent)
+        self.api_key, self.proxy = api_key, proxy
+
+    @Slot()
+    def run(self) -> None:
+        models = core.list_models(self.api_key, self.proxy, log=lambda m: log.info(m))
+        if models:
+            self.loaded.emit(models)
+        else:
+            self.failed.emit("no models returned")
+
+
 # ---------------------------------------------------------------- keys panel
 
 
@@ -164,6 +183,13 @@ class KeyManager(QGroupBox):
         layout.addLayout(top)
         layout.addWidget(remove)
         self.list.itemChanged.connect(lambda _: self.changed.emit())
+        self.changed.connect(lambda: self._on_keys_changed())
+
+    def _on_keys_changed(self) -> None:
+        """A new key is the cue to refresh the model list."""
+        parent = self.window()
+        if hasattr(parent, "fetch_models"):
+            parent.fetch_models()
 
     def _add(self) -> None:
         key = self.field.text().strip()
@@ -199,6 +225,8 @@ class MainWindow(QMainWindow):
         self.resize(1000, 700)
         self.worker: TranslateWorker | None = None
         self.thread: QThread | None = None
+        self.model_worker: ModelListWorker | None = None
+        self.model_thread: QThread | None = None
         self.rows: dict[str, int] = {}
         self.state: JobState | None = None
 
@@ -238,14 +266,18 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.keys_panel)
 
         self.model = QComboBox()
-        self.model.addItem("gemini-2.5-flash (fast, recommended)", "gemini-2.5-flash")
-        self.model.addItem("gemini-2.5-pro (highest quality, slower)", "gemini-2.5-pro")
-        self.model.addItem("gemini-2.0-flash (legacy free tier)", "gemini-2.0-flash")
+        for name in core.FALLBACK_MODELS:
+            self.model.addItem(name, name)
+        self.model.setToolTip("Models are loaded from the Gemini API once you add a key.")
+        self.refresh_models = QPushButton("Refresh models")
+        self.refresh_models.clicked.connect(lambda: self.fetch_models(startup=False))
+        self.model_busy = False
         self.skip_done = QCheckBox("Skip episodes already translated")
         self.skip_done.setChecked(True)
         options = QHBoxLayout()
         options.addWidget(QLabel("Model:"))
         options.addWidget(self.model)
+        options.addWidget(self.refresh_models)
         options.addSpacing(20)
         options.addWidget(self.skip_done)
         options.addStretch(1)
@@ -294,6 +326,63 @@ class MainWindow(QMainWindow):
 
         self.load_prefs()
         self.folder.textChanged.connect(self.scan)
+        # Fetch the real model list once at startup if a key is already saved.
+        QTimer.singleShot(0, lambda: self.fetch_models(startup=True))
+
+    # ---------------------------------------------------------- models
+
+    def fetch_models(self, startup: bool = False) -> None:
+        """Pull available models from the API. Needs a key; falls back silently."""
+        if self.model_busy:
+            return
+        keys = self.keys_panel.keys()
+        if not keys:
+            self.model.setToolTip("Add an API key, then press Refresh models.")
+            if not startup:
+                self.append_log("add an API key first, then Refresh models")
+            return
+        self.model_busy = True
+        self.refresh_models.setEnabled(False)
+        self.refresh_models.setText("Loading…")
+        proxy = self.proxy.text().strip() if self.use_proxy.isChecked() else ""
+
+        self.model_thread = QThread()
+        self.model_worker = ModelListWorker(keys[0], proxy)
+        self.model_worker.moveToThread(self.model_thread)
+        self.model_thread.started.connect(self.model_worker.run)
+        self.model_worker.loaded.connect(self._models_loaded)
+        self.model_worker.failed.connect(self._models_failed)
+        self.model_thread.start()
+
+    @Slot(list)
+    def _models_loaded(self, models: list) -> None:
+        current = self.model.currentData()
+        self.model.blockSignals(True)
+        self.model.clear()
+        for model_id in models:
+            self.model.addItem(core.describe_model(model_id), model_id)
+        self.model.blockSignals(False)
+        index = self.model.findData(current)
+        if index >= 0:
+            self.model.setCurrentIndex(index)
+        self._finish_model_fetch(f"{len(models)} model(s) available")
+
+    @Slot(str)
+    def _models_failed(self, message: str) -> None:
+        self._finish_model_fetch(message)
+
+    def _finish_model_fetch(self, message: str) -> None:
+        self.model_busy = False
+        self.refresh_models.setEnabled(True)
+        self.refresh_models.setText("Refresh models")
+        if self.model_thread is not None:
+            self.model_thread.quit()
+            self.model_thread.wait()
+            self.model_thread = None
+        self.model_worker = None
+        self.model.setToolTip(f"Loaded from Gemini API: {message}")
+        self.append_log(f"models: {message}")
+        log.info("model list: %s", message)
 
     # ---------------------------------------------------------- prefs
 

@@ -330,6 +330,89 @@ def test_proxy_transport_is_built_and_cached():
     assert direct._proxy_transport() is None
 
 
+def test_list_models_falls_back_without_a_key():
+    assert core.list_models("", "") == core.FALLBACK_MODELS
+    assert core.list_models("   ", "") == core.FALLBACK_MODELS
+
+
+def test_list_models_falls_back_on_error():
+    """A rejected key must never leave the picker empty or crash the GUI."""
+    logs = []
+    result = core.list_models("dummy-invalid-key", "", log=logs.append)
+    assert result == core.FALLBACK_MODELS, result
+    assert any("could not fetch" in m for m in logs), logs
+
+
+def test_describe_model_strips_path_prefix():
+    assert core.describe_model("models/gemini-2.5-flash") == "gemini-2.5-flash"
+    assert core.describe_model("gemini-2.5-pro") == "gemini-2.5-pro"
+
+
+def test_list_models_filters_non_chat_models():
+    """Embedding/image/TTS models come back from the same endpoint and must be
+    filtered out — they cannot translate text."""
+    import sys, types as _types
+
+    class FakeModel:
+        def __init__(self, name, actions):
+            self.name, self.supported_actions = name, actions
+
+    pager = [
+        FakeModel("models/gemini-2.5-flash", ["generateContent", "countTokens"]),
+        FakeModel("models/gemini-2.5-pro", ["generateContent"]),
+        FakeModel("models/text-embedding-004", ["embedContent"]),
+        FakeModel("models/imagen-3.0", ["predict"]),
+        FakeModel("models/gemini-2.0-flash-preview-tts", ["generateContent"]),
+    ]
+
+    class FakeModels:
+        def list(self):
+            return pager
+
+    class FakeClient:
+        def __init__(self, api_key=None, **kw):
+            self.models = FakeModels()
+
+    genai_mod = _types.ModuleType("google.genai")
+    genai_mod.Client = FakeClient
+    genai_mod.types = core_types_stub()
+    google_mod = _types.ModuleType("google")
+    google_mod.genai = genai_mod
+
+    old = {k: sys.modules.get(k) for k in ("google", "google.genai")}
+    sys.modules["google"] = google_mod
+    sys.modules["google.genai"] = genai_mod
+    try:
+        got = core.list_models("k", "")
+        assert got == ["gemini-2.5-flash", "gemini-2.5-pro"], got
+    finally:
+        for k, v in old.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
+def test_model_picker_populates_and_keeps_selection():
+    try:
+        import app  # noqa: PLC0415
+    except ImportError:
+        print("(skipped test_model_picker_populates_and_keeps_selection: no PySide6)")
+        return
+    from PySide6.QtWidgets import QApplication
+
+    qapp = QApplication.instance() or QApplication([])
+    w = app.MainWindow()
+    w.model.setCurrentIndex(1)  # user picks gemini-2.5-pro
+    chosen = w.model.currentData()
+    w._models_loaded(["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.5-flash-lite"])
+    assert w.model.count() == 3
+    assert w.model.currentData() == chosen, "selection must survive a refresh"
+    w._models_loaded(["only-one-model"])
+    assert w.model.count() == 1
+    assert w.model.currentData() == "only-one-model"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

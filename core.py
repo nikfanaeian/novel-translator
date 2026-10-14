@@ -241,6 +241,88 @@ def state_path(folder: str | os.PathLike) -> Path:
     return Path(folder) / ".noveltranslator_state.json"
 
 
+DEFAULT_PROXY = "socks5://127.0.0.1:10808"
+
+
+def normalize_proxy(value: str | None) -> str | None:
+    """Accept 'host:port' shorthand; return None to mean 'no proxy'.
+
+    'socks5h://' resolves DNS through the proxy, which is what you want when the
+    host can't be reached directly but the proxy can resolve it for you.
+    """
+    value = (value or "").strip()
+    if not value:
+        return None
+    if "://" in value:
+        return value
+    if value.lower().startswith(("127.0.0.1", "localhost", "::1")):
+        # Local proxy, so hostname-vs-IP resolution barely matters; keep it plain.
+        return f"socks5://{value}"
+    return f"socks5h://{value}"
+
+
+# ---------------------------------------------------------------- models
+
+# Used when the API call fails or no key is present yet, so the app is never
+# left with an empty model picker.
+FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+
+
+def list_models(
+    api_key: str, proxy: str | None = DEFAULT_PROXY, log: Callable[[str], None] = print
+) -> list[str]:
+    """Model IDs available for text generation, best-first.
+
+    Filters on supported_actions rather than name, because the API also returns
+    embedding, image, and TTS models that cannot translate anything. Falls back to
+    a known-good list so an offline or unauthorised key never breaks startup.
+    """
+    if not api_key.strip():
+        return list(FALLBACK_MODELS)
+    try:
+        import httpx
+        from google import genai
+        from google.genai import types
+
+        kwargs = {}
+        transport = None
+        if normalize_proxy(proxy):
+            try:
+                transport = httpx.HTTPTransport(proxy=normalize_proxy(proxy))
+                kwargs["http_options"] = types.HttpOptions(client_args={"transport": transport})
+            except ImportError:
+                log("socks support missing (pip install 'httpx[socks]'), connecting direct")
+        client = genai.Client(api_key=api_key.strip(), **kwargs)
+
+        found: list[str] = []
+        for model in client.models.list():
+            actions = getattr(model, "supported_actions", None) or []
+            if "generateContent" not in actions:
+                continue
+            name = model.name or ""
+            model_id = name.split("/")[-1]  # API returns "models/gemini-2.5-flash"
+            # Skip legacy/retired aliases and anything not chat-capable.
+            if not model_id.startswith("gemini"):
+                continue
+            if any(tag in model_id for tag in ("embedding", "imagen", "tts", "aqa", "vision")):
+                continue
+            found.append(model_id)
+
+        if not found:
+            log("no text-generation models returned; using defaults")
+            return list(FALLBACK_MODELS)
+        log(f"found {len(found)} model(s) available")
+        return sorted(set(found))
+    except Exception as exc:  # noqa: BLE001 - network/auth errors must not block the GUI
+        log(f"could not fetch model list ({_short(exc)}); using defaults")
+        return list(FALLBACK_MODELS)
+
+
+def describe_model(model_id: str) -> str:
+    """Short human label for the picker. Version suffixes are noise; keep the base."""
+    return model_id.split("/")[-1]
+
+
 # ---------------------------------------------------------------- translation
 
 # Default target languages the UI offers; Persian is first because that's the
@@ -279,26 +361,6 @@ dashes). Output ONLY the translation, with no preamble, notes, or commentary.
 
 class TranslationError(RuntimeError):
     """A single chunk failed after exhausting keys and retries."""
-
-
-DEFAULT_PROXY = "socks5://127.0.0.1:10808"
-
-
-def normalize_proxy(value: str | None) -> str | None:
-    """Accept 'host:port' shorthand; return None to mean 'no proxy'.
-
-    'socks5h://' resolves DNS through the proxy, which is what you want when the
-    host can't be reached directly but the proxy can resolve it for you.
-    """
-    value = (value or "").strip()
-    if not value:
-        return None
-    if "://" in value:
-        return value
-    if value.lower().startswith(("127.0.0.1", "localhost", "::1")):
-        # Local proxy, so hostname-vs-IP resolution barely matters; keep it plain.
-        return value if "://" in value else f"socks5://{value}"
-    return f"socks5h://{value}"
 
 
 @dataclass

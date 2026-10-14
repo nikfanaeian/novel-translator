@@ -11,6 +11,8 @@ occasional network drop. Nothing is lost when something goes wrong.
 
 - **Browse** any folder; picks up `.docx`, `.pdf`, and `.txt` episodes.
 - **Translates one episode at a time**, in natural order (`ep2` before `ep10`).
+- **Model list loaded live from the Gemini API** — filtered to chat-capable models
+  (embedding/image/TTS are excluded), refreshed on demand, never left empty.
 - **Multiple API keys**, rotated automatically. One key hitting its rate limit puts
   that key on cooldown instead of stalling the run.
 - **Progress bar** per episode (chunk-level) and for the job as a whole.
@@ -85,10 +87,10 @@ glossary for recurring terms.
 python test_core.py
 ```
 
-19 checks. Covers chunking (budget respected, no paragraph split mid-way, no content
+24 checks. Covers chunking (budget respected, no paragraph split mid-way, no content
 lost), natural sort, output naming, txt encodings (UTF-8/UTF-16/cp1256), proxy
-normalization and transport caching, and the state machine including "a failed
-episode leaves no output file".
+normalization and transport caching, model-list filtering and fallbacks, and the state
+machine including "a failed episode leaves no output file".
 
 Everything except the GUI-worker and proxy-transport checks runs on the stdlib alone.
 
